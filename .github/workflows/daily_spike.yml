@@ -1,0 +1,30 @@
+name: Daily Volume Spike Bot
+
+on:
+  schedule:
+    - cron: "0 21 * * *"   # Türkiye saati 00:00 (UTC+3) → UTC 21:00
+  workflow_dispatch:         # Manuel çalıştırma için
+
+jobs:
+  run-daily-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Depoyu klonla
+      uses: actions/checkout@v3
+
+    - name: Python kur
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    - name: Gerekli kütüphaneler
+      run: |
+        pip install ccxt pandas requests
+
+    - name: Günlük hacim botunu çalıştır
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+      run: |
+        python main.py
