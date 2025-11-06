@@ -1,0 +1,33 @@
+name: Mexc Multi-Timeframe Signals
+
+on:
+  schedule:
+    - cron: "*/20 * * * *"     # ✅ Her 20 dakikada çalışır
+  workflow_dispatch:           # ✅ Manuel çalıştırma butonu
+  push:
+    paths:
+      - "main.py"              # ✅ main.py değişince tetiklenir
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repo Checkout
+        uses: actions/checkout@v3
+
+      - name: Python Kurulumu
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Kütüphaneleri Kur
+        run: |
+          pip install pandas numpy requests
+
+      - name: Botu Çalıştır
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python main.py
