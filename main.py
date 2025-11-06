@@ -1,134 +1,217 @@
-# main.py — 1D “temiz” hacim botu (kırmızı mumları ele, yeşil + tepeye yakın şartı)
-import os, time, ccxt, pandas as pd, requests
+import os, time, requests, pandas as pd, numpy as np
+from datetime import datetime, timezone
 
-# ---- Günlük versiyon ayarları ----
-EXCHANGE         = os.getenv("EXCHANGE", "mexc")      # binance|mexc|kucoin|bybit|gateio
-QUOTE            = os.getenv("QUOTE", "USDT")
-TIMEFRAME        = os.getenv("TIMEFRAME", "1d")        # ✅ Günlük analiz
-LIMIT            = int(os.getenv("LIMIT", "200"))
-VOL_LOOKBACK     = int(os.getenv("VOL_LOOKBACK", "6")) # ✅ Son 6 günlük hacim ortalaması
-VOL_MULTIPLIER   = float(os.getenv("VOL_MULTIPLIER", "2.0"))
-PRICE_MAX_CHANGE = float(os.getenv("PRICE_MAX_CHANGE", "0.06")) # günlük mum max %6
-PRICE_MIN_CHANGE = float(os.getenv("PRICE_MIN_CHANGE", "0.00")) # 0.00 → kırmızıları ele
-BULLISH_ONLY     = os.getenv("BULLISH_ONLY", "true").lower() == "true"
-MAX_MARKETS      = int(os.getenv("MAX_MARKETS", "400"))
-CSV_OUT          = os.getenv("CSV_OUT", "volume_spike_daily_clean.csv")
+# === Ayarlar ===
+TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN")
+CHAT_ID=os.getenv("CHAT_ID")
 
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID          = os.getenv("CHAT_ID")
+# --- API URL ---
+MEXC="https://api.mexc.com"
+BINANCE="https://api.binance.com"
 
+def ts(): 
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-def load_exchange(name):
-    ex = getattr(ccxt, name)({'enableRateLimit': True})
-    ex.load_markets()
-    return ex
-
-
-def pick_symbols(ex, quote="USDT", max_markets=500):
-    syms = []
-    for s, m in ex.markets.items():
-        if m.get("active") and m.get("spot") and m.get("quote") == quote:
-            syms.append(s)
-    return sorted(set(syms))[:max_markets]
-
-
-def early_volume_spike(df, idx):
-    if idx < VOL_LOOKBACK:
-        return False
-
-    vol_avg = df["volume"].iloc[idx - VOL_LOOKBACK: idx].mean()
-    vol_cond = df["volume"].iloc[idx] >= VOL_MULTIPLIER * max(vol_avg, 1e-9)
-
-    c_now  = df["close"].iloc[idx]
-    c_prev = df["close"].iloc[idx - 1]
-
-    change = (c_now - c_prev) / max(c_prev, 1e-12)
-    price_band_ok = (change >= PRICE_MIN_CHANGE) and (change <= PRICE_MAX_CHANGE)
-
-    if not (vol_cond and price_band_ok):
-        return False
-
-    if BULLISH_ONLY:
-        o = df["open"].iloc[idx]
-        h = df["high"].iloc[idx]
-        l = df["low"].iloc[idx]
-        c = c_now
-
-        rng = max(h - l, 1e-12)
-        body = abs(c - o) / rng
-        near_high = (h - c) / rng <= 0.35      # tepeye daha yakın
-        if not (c > o and body >= 0.35 and near_high):
-            return False
-
-    return True
-
-
-def analyze_symbol(ex, symbol):
-    try:
-        raw = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT)
-        if not raw:
-            return None
-
-        df = pd.DataFrame(raw, columns=["time","open","high","low","close","volume"])
-        df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_convert("Europe/Istanbul")
-
-        idx = len(df) - 1
-        if early_volume_spike(df, idx):
-            return {
-                "symbol": symbol,
-                "bar_time": df["time"].iloc[idx],
-                "close": float(df["close"].iloc[idx]),
-                "volume": float(df["volume"].iloc[idx]),
-            }
-    except Exception:
-        pass
-    
+# --- HTTP yardımcı ---
+def jget(url, params=None, retries=4, timeout=10):
+    for _ in range(retries):
+        try:
+            r=requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+        except:
+            time.sleep(0.4)
     return None
 
-
-def send_to_telegram(message):
+def telegram(msg):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Telegram yok.")
+        print(msg)
         return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": message}, timeout=15)
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"})
     except:
         pass
 
+# -------------------------
+# ✅ 1 NUMARALI BOTTAKİ COIN ÇEKME SİSTEMİ
+# -------------------------
+
+def mexc_symbols(limit=150):
+    """MEXC hacme göre coin çeker (1 numaralı bot ile birebir aynı)"""
+    d=jget(f"{MEXC}/api/v3/ticker/24hr")
+    if not d: 
+        return []
+    coins=[x for x in d if x.get("symbol","").endswith("USDT")]
+    coins=sorted(coins, key=lambda x: float(x.get("quoteVolume",0)), reverse=True)
+    return [c["symbol"] for c in coins[:limit]]
+
+def binance_symbols(limit=150):
+    """MEXC cevap vermezse fallback olarak Binance kullanılır."""
+    d=jget(f"{BINANCE}/api/v3/exchangeInfo")
+    if not d or "symbols" not in d:
+        return []
+    rows=[s["symbol"] for s in d["symbols"] 
+          if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING"]
+    return rows[:limit]
+
+# -------------------------
+# --- Göstergeler ---
+# -------------------------
+
+def ema(x,n): 
+    return x.ewm(span=n, adjust=False).mean()
+
+def rsi(s,n=14):
+    d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
+    rs=up.ewm(alpha=1/n, adjust=False).mean()/(dn.ewm(alpha=1/n, adjust=False).mean()+1e-12)
+    return 100-(100/(1+rs))
+
+def adx(df,n=14):
+    up=df['high'].diff(); dn=-df['low'].diff()
+    plus=np.where((up>dn)&(up>0),up,0.0); minus=np.where((dn>up)&(dn>0),dn,0.0)
+
+    tr1=df['high']-df['low']
+    tr2=(df['high']-df['close'].shift()).abs()
+    tr3=(df['low']-df['close'].shift()).abs()
+    tr=pd.DataFrame({'a':tr1,'b':tr2,'c':tr3}).max(axis=1)
+
+    atr=tr.ewm(alpha=1/n, adjust=False).mean()
+    plus_di=100*pd.Series(plus).ewm(alpha=1/n, adjust=False).mean()/(atr+1e-12)
+    minus_di=100*pd.Series(minus).ewm(alpha=1/n, adjust=False).mean()/(atr+1e-12)
+
+    dx=((plus_di-minus_di).abs()/((plus_di+minus_di)+1e-12))*100
+    return dx.ewm(alpha=1/n, adjust=False).mean()
+
+def volume_ratio(turnover,n=10):
+    base=turnover.ewm(span=n, adjust=False).mean()
+    return float(turnover.iloc[-1]/(base.iloc[-2]+1e-12))
+
+
+# -------------------------
+# --- Kline verisi ---
+# -------------------------
+def klines(sym, interval="1h", limit=200, from_binance=False):
+    if not from_binance:
+        d=jget(f"{MEXC}/api/v3/klines", {"symbol":sym,"interval":interval,"limit":limit})
+        if not d: 
+            return None
+        try:
+            df=pd.DataFrame(d, 
+                columns=["t","o","h","l","c","v","qv","n","t1","t2","ig","ib"]).astype(float)
+            df.rename(columns={"c":"close","h":"high","l":"low","qv":"turnover"}, inplace=True)
+            return df
+        except:
+            return None
+    else:
+        d=jget(f"{BINANCE}/api/v3/klines", {"symbol":sym,"interval":interval,"limit":limit})
+        if not d:
+            return None
+        try:
+            df=pd.DataFrame(d,
+                columns=["t","o","h","l","c","v","ct","qv","tr","tb","tq","ig"]).astype(float)
+            df.rename(columns={"c":"close","h":"high","l":"low","v":"turnover"}, inplace=True)
+            return df
+        except:
+            return None
+
+# -------------------------
+# --- Analiz ---
+# -------------------------
+
+def analyze(sym, interval, from_binance=False):
+    df=klines(sym, interval, from_binance=from_binance)
+    if df is None or len(df)<80:
+        return None
+
+    if df["turnover"].iloc[-1] < 150_000:
+        return None
+
+    c=df["close"]; h=df["high"]; l=df["low"]; t=df["turnover"]
+
+    rr=float(rsi(c).iloc[-1])
+    e20,e50=ema(c,20).iloc[-1], ema(c,50).iloc[-1]
+    trend_up = e20 > e50
+
+    v_ratio = volume_ratio(t,10)
+    adx_val = float(adx(pd.DataFrame({"high":h,"low":l,"close":c}),14).iloc[-1])
+
+    last_dir = (c.iloc[-1] - c.iloc[-2]) >= 0
+    whale = t.iloc[-1] >= 800_000
+    whale_side = "BUY" if last_dir else "SELL"
+
+    side = None
+    if trend_up and rr>=50 and v_ratio>=1.15:
+        side = "BUY"
+    elif (not trend_up) and rr<=60 and v_ratio>=1.10:
+        side = "SELL"
+
+    if not side:
+        return None
+
+    conf = int(min(100, (v_ratio*25)+(adx_val/3)+(rr/5)))
+
+    return {
+        "symbol": sym,
+        "tf": interval.upper(),
+        "side": side,
+        "whale": whale,
+        "whale_side": whale_side,
+        "turnover": t.iloc[-1],
+        "rsi": rr,
+        "adx": adx_val,
+        "trend": "↑" if trend_up else "↓",
+        "v_ratio": v_ratio,
+        "conf": conf
+    }
+
+
+# -------------------------
+# --- Ana fonksiyon ---
+# -------------------------
 
 def main():
-    ex = load_exchange(EXCHANGE)
-    symbols = pick_symbols(ex, QUOTE, MAX_MARKETS)
-    print(f"{EXCHANGE.upper()} {QUOTE} — Günlük tarama: {len(symbols)} parite")
+    syms = mexc_symbols()
+    from_binance=False
 
-    hits = []
-    for i, sym in enumerate(symbols, 1):
-        res = analyze_symbol(ex, sym)
-        if res:
-            hits.append(res)
-            print(f"[MATCH] {sym} @ {res['bar_time']} close={res['close']:.6g}")
+    if not syms:
+        syms = binance_symbols()
+        from_binance=True
+        telegram("⚠️ MEXC hata verdi, Binance Spot ile devam ediliyor.")
 
-        if i % 20 == 0:
-            time.sleep(0.25)
+    if not syms:
+        telegram("⛔ Hiç sembol alınamadı (MEXC & Binance).")
+        return
 
-    df = pd.DataFrame(hits)
-    if not df.empty:
-        df.sort_values(["bar_time", "symbol"], inplace=True)
-        df.to_csv(CSV_OUT, index=False)
+    results = []
 
-        lines = ["🔥 Günlük (1D) Erken Hacim Sinyalleri 🔥", ""]
-        for _, r in df.iterrows():
-            lines.append(f"{r['symbol']} | Close={r['close']:.6g} | Vol={int(r['volume']):,}")
+    for s in syms:
+        for tf in ["1h","4h"]:
+            res = analyze(s, tf, from_binance)
+            if res:
+                results.append(res)
+        time.sleep(0.03)
 
-        send_to_telegram("\n".join(lines))
-        print(f"CSV kaydedildi: {CSV_OUT}")
-    else:
-        print("Eşleşme yok.")
-        send_to_telegram("📭 Günlük 1D taramada eşleşme yok.")
+    buys=[x for x in results if x["side"]=="BUY"]
+    sells=[x for x in results if x["side"]=="SELL"]
+
+    msg=[f"⚡ *Çoklu Zaman Dilimli Sinyaller*\n⏱ {ts()}\nTarama: {len(syms)} coin\nVeri: {'Binance' if from_binance else 'MEXC'}\n"]
+
+    if buys:
+        msg.append("\n🟢 *BUY Sinyalleri*")
+        for x in sorted(buys,key=lambda x:x["conf"],reverse=True)[:10]:
+            msg.append(f"- {x['symbol']} | {x['tf']} | Güven:{x['conf']}")
+
+    if sells:
+        msg.append("\n🔴 *SELL Sinyalleri*")
+        for x in sorted(sells,key=lambda x:x["conf"],reverse=True)[:10]:
+            msg.append(f"- {x['symbol']} | {x['tf']} | Güven:{x['conf']}")
+
+    if not buys and not sells:
+        msg.append("ℹ️ Sinyal yok.")
+
+    telegram("\n".join(msg))
 
 
 if __name__ == "__main__":
     main()
-
