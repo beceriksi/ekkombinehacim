@@ -4,21 +4,21 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
-      - name: Install Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v3
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
       - name: Install deps
         run: |
-          pip install requests
+          python -m pip install --upgrade pip
 
-      - name: Run Test
-        run: |
-          python test_dex_okx.py
+      - name: Run Dex Test
+        run: python test_list_dex.py
+
+      - name: Run OKX Test
+        run: python test_kline_okx.py
