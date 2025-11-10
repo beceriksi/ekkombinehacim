@@ -1,4 +1,5 @@
-name: test_run
+name: TEST
+
 on:
   workflow_dispatch:
 
@@ -6,16 +7,18 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Repo checkout
+      - name: Checkout repo
         uses: actions/checkout@v3
 
-      - name: Python kurulum
+      - name: Install Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: '3.11'
 
-      - name: Pip install
-        run: pip install pandas requests
+      - name: Install deps
+        run: |
+          pip install requests
 
-      - name: Test Binance visibility
-        run: python test_binance_visibility.py
+      - name: Run Test
+        run: |
+          python test_dex_okx.py
