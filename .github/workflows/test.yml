@@ -1,24 +1,19 @@
 name: TEST
-
 on:
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v3
-
       - name: Setup Python
         uses: actions/setup-python@v3
         with:
           python-version: '3.10'
-
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests
-
-      - name: Run Dex Test
-        run: python test_list_dex.py
+      - name: Test OKX kline
+        run: python test_okx_kline.py
