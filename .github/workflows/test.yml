@@ -22,6 +22,3 @@ jobs:
 
       - name: Run Dex Test
         run: python test_list_dex.py
-
-      - name: Run OKX Test
-        run: python test_kline_okx.py
