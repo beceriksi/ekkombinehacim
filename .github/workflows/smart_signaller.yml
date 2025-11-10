@@ -1,0 +1,52 @@
+name: smart_signaller
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"   # her 15 dk'da bir
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy
+
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+
+          # ---- İsteğe göre ayarlar (değiştirmezsen default'lar main.py içindeki gibi) ----
+          TOP_N: "200"
+          SCAN_TFS: "1H"
+          MIN_TURNOVER_USD: "100000"
+          WHALE_L: "300000"
+          WHALE_XL: "800000"
+          WHALE_XXL: "2000000"
+          VOL_EMA_N: "10"
+          VOL_RATIO_BUY: "1.25"
+          VOL_RATIO_SELL: "1.15"
+          CLUSTER_LOOKBACK: "4"
+          CLUSTER_MIN_HITS: "2"
+          CLUSTER_SUM_RATIO: "1.60"
+          RSI_BUY_MIN: "52.0"
+          RSI_SELL_MAX: "48.0"
+          ADX_MIN_BUY: "18.0"
+          ADX_MIN_SELL: "15.0"
+          MARKET_REQUIRE_UP: "true"
+          MAX_ROWS_TELEGRAM: "22"
+        run: |
+          python main.py
