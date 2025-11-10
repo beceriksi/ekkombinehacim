@@ -1,28 +1,41 @@
-import os, time, requests, pandas as pd, numpy as np
+import os, time, math, requests, pandas as pd, numpy as np
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ====== SECRETS ======
+# =============== AYARLAR (ENV ile değiştirilebilir) ===============
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
 
-# ====== ENDPOINTS ======
-MEXC      = "https://api.mexc.com"                 # Spot
-COINGECKO = "https://api.coingecko.com/api/v3/global"
+TOP_N              = int(os.getenv("TOP_N",              "200"))   # OKX USDT spot ilk N
+SCAN_TFS           = os.getenv("SCAN_TFS",              "1H").split(",")  # "1H" sabit önerim
+MIN_TURNOVER_USD   = float(os.getenv("MIN_TURNOVER_USD", "100000"))# tek mumda min $ hacim
+WHALE_L            = float(os.getenv("WHALE_L",          "300000"))
+WHALE_XL           = float(os.getenv("WHALE_XL",         "800000"))
+WHALE_XXL          = float(os.getenv("WHALE_XXL",        "2000000"))
 
-# ====== PARAMETRELER (gerekirse GitHub Secrets -> ENV ile değiştir) ======
-TOP_N            = int(os.getenv("TOP_N", "200"))        # Hacme göre ilk N USDT çifti
-MIN_TURNOVER_1H  = float(os.getenv("MIN_TURNOVER_1H", "300000"))   # 1H son bar USDT hacim tabanı
-MIN_TURNOVER_4H  = float(os.getenv("MIN_TURNOVER_4H", "600000"))
-MIN_TURNOVER_1D  = float(os.getenv("MIN_TURNOVER_1D", "2500000"))
-VOL_EMA_N        = int(os.getenv("VOL_EMA_N", "10"))
-BUY_VOL_RATIO    = float(os.getenv("BUY_VOL_RATIO", "1.15"))       # 1H/4H/1D için ortak kullanılır
-SELL_VOL_RATIO   = float(os.getenv("SELL_VOL_RATIO", "0.95"))       # SELL için hacim şartı gevşek
-ACCUM_LOOKBACK   = int(os.getenv("ACCUM_LOOKBACK", "48"))           # 1H içinde son X bar
-ACCUM_MIN_HITS   = int(os.getenv("ACCUM_MIN_HITS", "4"))            # Son X bar içinde min BUY sayısı
+VOL_EMA_N          = int(os.getenv("VOL_EMA_N",          "10"))    # hacim EMA periyodu
+VOL_RATIO_BUY      = float(os.getenv("VOL_RATIO_BUY",    "1.25"))  # son mum / EMA-1
+VOL_RATIO_SELL     = float(os.getenv("VOL_RATIO_SELL",   "1.15"))
 
-# ====== Yardımcılar ======
-def ts(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+CLUSTER_LOOKBACK   = int(os.getenv("CLUSTER_LOOKBACK",   "4"))     # son 4 mum
+CLUSTER_MIN_HITS   = int(os.getenv("CLUSTER_MIN_HITS",   "2"))     # 4 mumdan en az 2’si spike
+CLUSTER_SUM_RATIO  = float(os.getenv("CLUSTER_SUM_RATIO","1.60"))  # son 4 toplam / 4*EMA-2
+
+RSI_BUY_MIN        = float(os.getenv("RSI_BUY_MIN",      "52.0"))
+RSI_SELL_MAX       = float(os.getenv("RSI_SELL_MAX",     "48.0"))
+ADX_MIN_BUY        = float(os.getenv("ADX_MIN_BUY",      "18.0"))  # düşükte noise artar
+ADX_MIN_SELL       = float(os.getenv("ADX_MIN_SELL",     "15.0"))
+
+MARKET_REQUIRE_UP  = os.getenv("MARKET_REQUIRE_UP", "true").lower()=="true"  # BUY için pazar filtre
+MAX_ROWS_TELEGRAM  = int(os.getenv("MAX_ROWS_TELEGRAM",  "22"))    # iletideki satır limiti
+
+# =============== SABİTLER ===============
+OKX = "https://www.okx.com"
+COINGECKO = "https://api.coingecko.com/api/v3"
+
+# =============== GENEL UTİLLER ===============
+def ts():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 def jget(url, params=None, retries=3, timeout=12):
     for _ in range(retries):
@@ -31,7 +44,7 @@ def jget(url, params=None, retries=3, timeout=12):
             if r.status_code == 200:
                 return r.json()
         except:
-            time.sleep(0.3)
+            time.sleep(0.4)
     return None
 
 def telegram(text):
@@ -39,199 +52,222 @@ def telegram(text):
         print(text); return
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=20)
+                      json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
     except: pass
 
-# ====== İndikatörler ======
-def ema(x,n): return x.ewm(span=n, adjust=False).mean()
+# =============== GÖSTERGELER ===============
+def ema(x, n): return x.ewm(span=n, adjust=False).mean()
 
-def rsi(s, n=14):
-    d=s.diff(); up=d.clip(lower=0); dn=-d.clip(upper=0)
+def rsi(close, n=14):
+    d = close.diff()
+    up = d.clip(lower=0); dn = -d.clip(upper=0)
     rs = up.ewm(alpha=1/n, adjust=False).mean() / (dn.ewm(alpha=1/n, adjust=False).mean() + 1e-12)
-    return 100 - (100/(1+rs))
+    return 100 - (100 / (1 + rs))
 
-def adx(df, n=14):
-    up = df['high'].diff(); dn = -df['low'].diff()
+def adx_from_hlc(h, l, c, n=14):
+    up = h.diff(); dn = -l.diff()
     plus  = np.where((up>dn)&(up>0), up, 0.0)
     minus = np.where((dn>up)&(dn>0), dn, 0.0)
-    tr1 = df['high']-df['low']
-    tr2 = (df['high']-df['close'].shift()).abs()
-    tr3 = (df['low'] -df['close'].shift()).abs()
-    tr  = pd.DataFrame({'a':tr1,'b':tr2,'c':tr3}).max(axis=1)
+    tr = pd.DataFrame({'a':h-l, 'b':(h-c.shift()).abs(), 'c':(l-c.shift()).abs()}).max(axis=1)
     atr = tr.ewm(alpha=1/n, adjust=False).mean()
     plus_di  = 100*pd.Series(plus ).ewm(alpha=1/n, adjust=False).mean()/(atr+1e-12)
     minus_di = 100*pd.Series(minus).ewm(alpha=1/n, adjust=False).mean()/(atr+1e-12)
     dx = ((plus_di - minus_di).abs() / ((plus_di + minus_di) + 1e-12)) * 100
     return dx.ewm(alpha=1/n, adjust=False).mean()
 
-def volume_ratio(turnover, n=VOL_EMA_N):
-    base = turnover.ewm(span=n, adjust=False).mean()
-    return float(turnover.iloc[-1] / (base.iloc[-2] + 1e-12))
+# =============== OKX KAYNAKLARI ===============
+def okx_top_usdt_spot(TOP=200):
+    """
+    OKX spot tickers içinden USDT paritelerini 24h quote hacmine göre sıralar.
+    instId örn: 'BTC-USDT'
+    """
+    t = jget(f"{OKX}/api/v5/market/tickers", {"instType":"SPOT"})
+    if not t or "data" not in t: return []
+    rows = []
+    for x in t["data"]:
+        inst = x.get("instId","")
+        if not inst.endswith("-USDT"): continue
+        # volCcy24h genelde quote taraf (USDT) – yoksa fallback olarak 24h vol * son fiyat
+        qc = x.get("volCcy24h")
+        try:
+            qv = float(qc) if qc is not None else float(x.get("last","0"))*float(x.get("vol24h","0"))
+        except:
+            qv = 0.0
+        rows.append((inst, qv))
+    rows.sort(key=lambda z: z[1], reverse=True)
+    return [r[0] for r in rows[:TOP]]
 
-# ====== Coin listesi (MEXC Spot – 1. bot mantığının aynısı) ======
-def mexc_spot_top_usdt(limit=TOP_N):
-    d = jget(f"{MEXC}/api/v3/ticker/24hr")
-    if not d: return []
-    rows = [x for x in d if x.get("symbol","").endswith("USDT")]
-    rows.sort(key=lambda x: float(x.get("quoteVolume","0")), reverse=True)
-    return [x["symbol"] for x in rows[:limit]]
+def okx_candles(instId, bar="1H", limit=150):
+    """
+    OKX candles -> [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]
+    volCcy çoğu durumda base ccy değil; ama genelde quote USDT hacmi mevcut oluyor.
+    Yoksa approx: mid_price * vol
+    """
+    d = jget(f"{OKX}/api/v5/market/candles", {"instId":instId, "bar":bar, "limit":limit})
+    if not d or "data" not in d or len(d["data"])==0: return None
+    arr = d["data"]  # reverse chronological -> ilk eleman en yeni
+    arr.reverse()
+    recs = []
+    for row in arr:
+        # değişen uzunluklara dayanıklı parse:
+        ts, o, h, l, c = row[0], row[1], row[2], row[3], row[4]
+        vol = row[5] if len(row) > 5 else "0"
+        volCcy = row[6] if len(row) > 6 else None
+        try:
+            o=float(o); h=float(h); l=float(l); c=float(c)
+            v=float(vol)
+            if volCcy is not None:
+                t = float(volCcy)
+            else:
+                mid = (o+c)/2.0
+                t   = v * mid
+            recs.append((int(ts), o, h, l, c, v, t))
+        except:
+            continue
+    if not recs: return None
+    df = pd.DataFrame(recs, columns=["ts","open","high","low","close","volume","turnover"])
+    return df
 
-# ====== Kline (MEXC Spot) ======
-def klines(symbol, interval="1h", limit=240):
-    d = jget(f"{MEXC}/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    if not d: return None
-    try:
-        df = pd.DataFrame(d, columns=[
-            "t","o","h","l","c","v","qv","n","t1","t2","ig","ib"
-        ])
-        df = df.astype({"o":"float","h":"float","l":"float","c":"float","v":"float","qv":"float"})
-        df.rename(columns={"c":"close","h":"high","l":"low","qv":"turnover"}, inplace=True)
-        return df[["close","high","low","turnover"]]
-    except:
-        return None
+# =============== HACİM–KÜMESİ ve SİNYAL MANTIĞI ===============
+def vol_ratio_series(turnover, n=10):
+    base = ema(turnover, n)
+    # son mum / EMA-1 (son değer EMA’nın kendisi, bir önceki daha temiz)
+    return turnover / (base.shift(1) + 1e-12)
 
-# ====== Piyasa Notu (opsiyonel bilgilendirme) ======
-def market_note():
-    g = jget(COINGECKO)
+def cluster_pass(df, n=VOL_EMA_N):
+    """Son CLUSTER_LOOKBACK mum içinde kaç spike var ve toplam ratio yeterli mi?"""
+    r = vol_ratio_series(df["turnover"], n)
+    recent = r.iloc[-CLUSTER_LOOKBACK:]
+    hits = int((recent >= VOL_RATIO_BUY).sum())
+    # toplamsal eşik: son4 toplam / (4*EMA-2)
+    ema_prev2 = ema(df["turnover"], n).shift(2).iloc[-1]
+    cluster_sum = df["turnover"].iloc[-CLUSTER_LOOKBACK:].sum()
+    cluster_ratio = float(cluster_sum / (CLUSTER_LOOKBACK * (ema_prev2 + 1e-12)))
+    return (hits >= CLUSTER_MIN_HITS) and (cluster_ratio >= CLUSTER_SUM_RATIO), hits, cluster_ratio, float(r.iloc[-1])
+
+def whale_tier(turnover_last):
+    if turnover_last >= WHALE_XXL: return "XXL"
+    if turnover_last >= WHALE_XL:  return "XL"
+    if turnover_last >= WHALE_L:   return "L"
+    return "-"
+
+def market_filter_allow_buy():
+    """Piyasa filtresi: BTC 1H trend & Coingecko Total2 hissiyatı (yaklaşık)."""
+    if not MARKET_REQUIRE_UP: return True
+    # BTC 1H trend
+    btc = okx_candles("BTC-USDT","1H",120)
+    if btc is None or len(btc)<40: return True  # veri yoksa engelleme
+    e20 = ema(btc["close"],20).iloc[-1]
+    e50 = ema(btc["close"],50).iloc[-1]
+    trend_ok = e20 > e50
+
+    g = jget(f"{COINGECKO}/global")
+    total_ok = True
     try:
         total = float(g["data"]["market_cap_change_percentage_24h_usd"])
-        btcd  = float(g["data"]["market_cap_percentage"]["btc"])
-        usdt  = float(g["data"]["market_cap_percentage"]["usdt"])
+        total_ok = total >= -0.5   # çok negatifse BUY kısıtla
     except:
-        return "Piyasa: veri alınamadı."
-    total2 = "↑ (Altlara giriş)" if total>0 else ("↓ (Çıkış)" if total<0 else "→ (Karışık)")
-    usdt_note = f"{usdt:.1f}%"
-    if usdt>=7: usdt_note += " (riskten kaçış)"
-    elif usdt<=5: usdt_note += " (risk alımı)"
-    return f"Piyasa: BTC.D {btcd:.1f}% | Total2: {total2} | USDT.D: {usdt_note}"
+        pass
+    return trend_ok and total_ok
 
-# ====== Sinyal Koşulları ======
-def buy_condition(c, h, l, t, tf):
-    vratio = volume_ratio(t)
-    e20, e50 = ema(c,20).iloc[-1], ema(c,50).iloc[-1]
-    r = float(rsi(c).iloc[-1])
+def analyze_one(instId, tf):
+    df = okx_candles(instId, tf, 180)
+    if df is None or len(df)<60: return None, "short"
+    # min likidite
+    if float(df["turnover"].iloc[-1]) < MIN_TURNOVER_USD:
+        return None, "lowliq"
+
+    c = df["close"]; h = df["high"]; l = df["low"]; t = df["turnover"]
+    e20 = float(ema(c,20).iloc[-1]); e50 = float(ema(c,50).iloc[-1])
     trend_up = e20 > e50
-    # Likidite tabanı
-    liq_ok = (t.iloc[-1] >= (MIN_TURNOVER_1H if tf=="1h" else MIN_TURNOVER_4H if tf=="4h" else MIN_TURNOVER_1D))
-    return (liq_ok and trend_up and r >= 50 and vratio >= BUY_VOL_RATIO), vratio, r, trend_up
+    rr = float(rsi(c,14).iloc[-1])
+    adxv = float(adx_from_hlc(h,l,c,14).iloc[-1])
 
-def sell_condition(c, h, l, t, tf):
-    vratio = volume_ratio(t)
-    e20, e50 = ema(c,20).iloc[-1], ema(c,50).iloc[-1]
-    r = float(rsi(c).iloc[-1])
-    trend_down = e20 < e50
-    ret1 = float(c.iloc[-1]/(c.iloc[-2]+1e-12) - 1.0)
-    # SELL için hacmi şart koşmuyoruz; düşüş momentumu + trend kırmızı
-    liq_ok = (t.iloc[-1] >= (MIN_TURNOVER_1H if tf=="1h" else MIN_TURNOVER_4H if tf=="4h" else MIN_TURNOVER_1D))
-    return (liq_ok and trend_down and (r <= 48 or ret1 <= -0.015 or vratio <= SELL_VOL_RATIO)), vratio, r, (not trend_down)
+    # hacim kümesi
+    cl_ok, cl_hits, cl_sum_ratio, v_ratio_last = cluster_pass(df, VOL_EMA_N)
+    if not cl_ok: return None, "nocluster"
 
-def confidence_score(vratio, r, adx_val, trend_up):
-    # 0–100 ölçeği
-    base = 20
-    sc = base + min(40, (vratio-1.0)*40) + min(25, max(0,(r-40))*1.0) + min(25, adx_val/2.5)
-    if trend_up: sc += 5
-    return int(max(0, min(100, sc)))
+    side = None
+    if trend_up and rr >= RSI_BUY_MIN and v_ratio_last >= VOL_RATIO_BUY and adxv >= ADX_MIN_BUY:
+        if market_filter_allow_buy():
+            side = "BUY"
+        else:
+            return None, "mkt"
+    elif (not trend_up) and rr <= RSI_SELL_MAX and v_ratio_last >= VOL_RATIO_SELL and adxv >= ADX_MIN_SELL:
+        side = "SELL"
+    else:
+        return None, "rules"
 
-# ====== Accumulation (son 48 saat içinde ≥4 kez 1H BUY koşulu) ======
-def accumulation_tag(df1h):
-    if df1h is None or len(df1h) < max(60, ACCUM_LOOKBACK+50):
-        return 0, False
-    c, h, l, t = df1h["close"], df1h["high"], df1h["low"], df1h["turnover"]
-    # Hesaplamaları bir defa yap
-    e20 = ema(c,20); e50 = ema(c,50); r = rsi(c)
-    base = t.ewm(span=VOL_EMA_N, adjust=False).mean()
-    vratio = t / (base.shift(1) + 1e-12)
-    cnt=0
-    for i in range(len(c)-ACCUM_LOOKBACK, len(c)):
-        if i < 55: continue
-        liq_ok = t.iloc[i] >= MIN_TURNOVER_1H
-        if liq_ok and (e20.iloc[i] > e50.iloc[i]) and (r.iloc[i] >= 50) and (vratio.iloc[i] >= BUY_VOL_RATIO):
-            cnt += 1
-    return cnt, (cnt >= ACCUM_MIN_HITS)
+    # güven puanı (0–100)
+    # bileşenler: v_ratio_last, cl_hits, cl_sum_ratio, adxv, rsi uzaklık, whale
+    last_turn = float(t.iloc[-1])
+    tier = whale_tier(last_turn)
+    whale_bonus = {"-":0, "L":6, "XL":12, "XXL":18}[tier]
+    rsi_comp = (rr-50) if side=="BUY" else (50-rr)  # BUY’da +, SELL’de rr küçükse +
+    rsi_score = max(0, min(15, rsi_comp*1.0))
+    adx_score = max(0, min(15, (adxv-ADX_MIN_BUY if side=="BUY" else adxv-ADX_MIN_SELL)))
+    v_score   = max(0, min(25, (v_ratio_last-1.0)*25))          # 1.00 → 0, 2.00 → ~25
+    cl_score  = max(0, min(20, (cl_hits-CLUSTER_MIN_HITS+1)*8)) # daha çok hit → daha iyi
+    sum_score = max(0, min(15, (cl_sum_ratio-1.0)*15))
+    conf = int(max(0, min(100, whale_bonus + rsi_score + adx_score + v_score + cl_score + sum_score)))
 
-# ====== Tek sembol değerlendirme ======
-def eval_symbol(sym):
-    out = {"symbol": sym, "BUY": [], "SELL": [], "accum": None}
-    # 1H / 4H / 1D verilerini çek
-    d1h = klines(sym, "1h", 260)
-    d4h = klines(sym, "4h", 260)
-    d1d = klines(sym, "1d", 400)
-    # Accumulation etiketi (1H içinden)
-    acc_cnt, acc_flag = accumulation_tag(d1h)
-    if acc_flag: out["accum"] = f"TOPLANIYOR (48s/≥4) [{acc_cnt}]"
-    # 1H/4H/1D sinyalleri
-    for tf, df in (("1h", d1h), ("4h", d4h), ("1d", d1d)):
-        if df is None or len(df) < 60: continue
-        c,h,l,t = df["close"], df["high"], df["low"], df["turnover"]
-        # ADX bilgi amaçlı
-        adx_val = float(adx(pd.DataFrame({"high":h,"low":l,"close":c}),14).iloc[-1])
-        ok_buy, v_b, r_b, tr_up  = buy_condition(c,h,l,t,tf)
-        ok_sell,v_s, r_s, _      = sell_condition(c,h,l,t,tf)
-        if ok_buy:
-            conf = confidence_score(v_b, r_b, adx_val, tr_up)
-            out["BUY"].append((tf.upper(), conf, v_b, r_b, adx_val, float(c.iloc[-1])))
-        if ok_sell:
-            conf = confidence_score(max(1.0, v_s), max(0.0, 100-r_s), adx_val, False)
-            out["SELL"].append((tf.upper(), conf, v_s, r_s, adx_val, float(c.iloc[-1])))
-    return out
+    return {
+        "inst": instId,
+        "tf": tf,
+        "side": side,
+        "rsi": rr,
+        "adx": adxv,
+        "trend": "↑" if trend_up else "↓",
+        "v_ratio": v_ratio_last,
+        "cl_hits": cl_hits,
+        "cl_sum": cl_sum_ratio,
+        "turnover": last_turn,
+        "whale": tier,
+        "conf": conf
+    }, None
 
-# ====== Ana ======
+# =============== ANA AKIŞ ===============
 def main():
-    syms = mexc_spot_top_usdt(TOP_N)
-    if not syms:
-        telegram("⛔ MEXC 24hr yanıtı yok; sembol listesi alınamadı.")
-        return
+    symbols = okx_top_usdt_spot(TOP_N)
+    if not symbols:
+        telegram(f"⛔ Coin listesi alınamadı (OKX). {ts()}"); return
 
-    note = market_note()
-    results = []
     start = time.time()
-
+    results, stats = [], {"short":0,"lowliq":0,"nocluster":0,"mkt":0,"rules":0}
     with ThreadPoolExecutor(max_workers=10) as ex:
-        futs = [ex.submit(eval_symbol, s) for s in syms]
+        futs = [ex.submit(analyze_one, s, tf) for s in symbols for tf in SCAN_TFS]
         for f in as_completed(futs):
             try:
-                r = f.result()
+                r, flag = f.result()
                 if r: results.append(r)
-            except: pass
+                elif flag: stats[flag] = stats.get(flag,0)+1
+            except:
+                pass
 
-    buys, sells, accums = [], [], []
-    for r in results:
-        if r.get("accum"): accums.append((r["symbol"], r["accum"]))
-        if r["BUY"]:
-            # en yüksek güvenden birini göster
-            best = sorted(r["BUY"], key=lambda z: z[1], reverse=True)[0]
-            buys.append((r["symbol"],) + best)  # (sym, TF, conf, vratio, rsi, adx, last)
-        if r["SELL"]:
-            best = sorted(r["SELL"], key=lambda z: z[1], reverse=True)[0]
-            sells.append((r["symbol"],) + best)
+    buys  = [x for x in results if x["side"]=="BUY"]
+    sells = [x for x in results if x["side"]=="SELL"]
 
-    buys.sort(key=lambda x: x[2], reverse=True)
-    sells.sort(key=lambda x: x[2], reverse=True)
+    # ileti
+    lines = [f"⚡ *OKX USDT Spot 1H Akıllı Tarama*\n⏱ {ts()}\n🔎 Tarama: {len(symbols)} coin | Süre: {int(time.time()-start)} sn"]
+    if results:
+        conf_avg = int(sum(x["conf"] for x in results)/max(1,len(results)))
+        lines.append(f"🛡️ Güven Ort.: {conf_avg}/100")
+    lines.append(f"🚧 Atl.: short:{stats['short']} | lowliq:{stats['lowliq']} | nocluster:{stats['nocluster']} | market:{stats['mkt']} | rules:{stats['rules']}")
 
-    lines = [
-        f"⚡ *MEXC Spot Çoklu Tarama (1H • 4H • 1D)*",
-        f"⏱ {ts()}",
-        f"📊 Taranan: {len(syms)} coin | Süre: {int(time.time()-start)} sn",
-        f"{note}",
-    ]
-
-    if accums:
-        lines.append("\n🟪 *Toplanıyor Etiketleri* (1H, 48s içinde ≥4 BUY)")
-        for s, tag in accums[:15]:
-            lines.append(f"- {s} → {tag}")
+    def fmt(x):
+        return f"- {x['inst']} | {x['tf']} | {('🟢 BUY' if x['side']=='BUY' else '🔴 SELL')} | Güven:{x['conf']} | RSI:{x['rsi']:.1f} | ADX:{x['adx']:.0f} | vRatio:{x['v_ratio']:.2f} | Cluster:{x['cl_hits']}/{CLUSTER_LOOKBACK} Σ:{x['cl_sum']:.2f} | Whale:{x['whale']}"
 
     if buys:
-        lines.append("\n🟢 *BUY (en iyi 15)*  |  Format: COIN | TF | Güven | Vx | RSI | ADX | Fiyat")
-        for sym, tf, conf, v, r, ax, last in buys[:15]:
-            lines.append(f"- {sym} | {tf} | {conf}/100 | x{v:.2f} | {r:.1f} | {ax:.0f} | {last:g}")
-
+        lines.append("\n🟢 *BUY (en yüksek güven)*")
+        for x in sorted(buys, key=lambda z:z["conf"], reverse=True)[:MAX_ROWS_TELEGRAM//2]:
+            lines.append(fmt(x))
     if sells:
-        lines.append("\n🔴 *SELL (en iyi 15)* |  Format: COIN | TF | Güven | Vx | RSI | ADX | Fiyat")
-        for sym, tf, conf, v, r, ax, last in sells[:15]:
-            lines.append(f"- {sym} | {tf} | {conf}/100 | x{v:.2f} | {r:.1f} | {ax:.0f} | {last:g}")
+        lines.append("\n🔴 *SELL (en yüksek güven)*")
+        for x in sorted(sells, key=lambda z:z["conf"], reverse=True)[:MAX_ROWS_TELEGRAM//2]:
+            lines.append(fmt(x))
 
-    if not buys and not sells and not accums:
-        lines.append("\nℹ️ Şu an kriterlere uyan sinyal yok.")
+    if not buys and not sells:
+        lines.append("\nℹ️ Şu an kriterlere uyan sinyal yok (filtreler sıkı olduğunda normal).")
 
     telegram("\n".join(lines))
 
